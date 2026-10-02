@@ -511,6 +511,12 @@ window.__ModuleLoader__.load({
   outline: 2px solid var(--dsw-alias-brand-primary);
   outline-offset: 1px;
 }
+.dsh-bilibili-qualitytag {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-secondary);
+  white-space: nowrap;
+}
 .dsh-bilibili-videowrap {
   position: relative;
   width: 100%;
@@ -1020,6 +1026,9 @@ window.__ModuleLoader__.load({
       });
       const videoRef = React.useRef(null);
       const engineRef = React.useRef(null);
+      // Set when DASH fails to start playing: the rest of the session then goes
+      // straight to the progressive mp4 path instead of retrying MSE.
+      const forceMp4Ref = React.useRef(false);
 
       // Resolve a source: DASH first so the viewer gets the real ceiling, then
       // the progressive mp4 path when MSE cannot take the stream. `qn` 0 means
@@ -1037,11 +1046,13 @@ window.__ModuleLoader__.load({
             (qn > 0 ? '&qn=' + qn : '');
           try {
             let dash = null;
-            try {
-              const payload = await callHost('GET', undefined, DASH + suffix);
-              if (payload.ok && payload.video) dash = payload;
-            } catch (error) {
-              dash = null;
+            if (!forceMp4Ref.current) {
+              try {
+                const payload = await callHost('GET', undefined, DASH + suffix);
+                if (payload.ok && payload.video) dash = payload;
+              } catch (error) {
+                dash = null;
+              }
             }
             if (dash !== null && canPlayDash(dash)) {
               setState({
@@ -1076,6 +1087,12 @@ window.__ModuleLoader__.load({
         [item.bvid, item.cid],
       );
 
+      const resolveRef = React.useRef(resolve);
+      React.useEffect(() => {
+        resolveRef.current = resolve;
+      });
+      const resolveNow = React.useCallback((qn, resumeAt) => resolveRef.current(qn, resumeAt), []);
+
       React.useEffect(() => {
         resolve(0, 0);
       }, [resolve]);
@@ -1098,6 +1115,8 @@ window.__ModuleLoader__.load({
         let engine = null;
         try {
           engine = startDash(element, state.descriptor, (error) => {
+            // eslint-disable-next-line no-console
+            console.error('[dsh-bilibili] DASH pipeline failed:', error);
             setState({
               status: 'error',
               error: String((error && error.message) || error),
@@ -1105,17 +1124,33 @@ window.__ModuleLoader__.load({
           });
           engineRef.current = engine;
         } catch (error) {
+          // eslint-disable-next-line no-console
+          console.error('[dsh-bilibili] DASH setup threw:', error);
           setState({
             status: 'error',
             error: 'DASH playback failed: ' + String((error && error.message) || error),
           });
         }
+        // Safety net: MSE is browser-only behaviour this plugin cannot self-test,
+        // so if nothing has started playing shortly after, drop to the plain mp4
+        // path rather than leaving the viewer with a dead player.
+        let stopped = false;
+        const stallTimer = setTimeout(() => {
+          const current = videoRef.current;
+          if (current === null || stopped || current.readyState >= 2) return;
+          // eslint-disable-next-line no-console
+          console.error('[dsh-bilibili] DASH did not start within 7s; using mp4');
+          forceMp4Ref.current = true;
+          resolveNow(0, current.currentTime || 0);
+        }, 7000);
         return () => {
+          stopped = true;
+          clearTimeout(stallTimer);
           element.removeEventListener('loadedmetadata', applyResume);
           if (engine !== null) engine.stop();
           engineRef.current = null;
         };
-      }, [state.status, state.mode, state.descriptor]);
+      }, [state.status, state.mode, state.descriptor, resolveNow]);
 
       // Keep the position when the source is swapped (mp4 quality switch).
       const onLoadedMetadata = () => {
@@ -1145,6 +1180,16 @@ window.__ModuleLoader__.load({
               playsInline: true,
               preload: 'metadata',
               onLoadedMetadata: state.mode === 'mp4' ? onLoadedMetadata : undefined,
+              onError: () => {
+                const el = videoRef.current;
+                const media = el && el.error;
+                // eslint-disable-next-line no-console
+                console.error(
+                  '[dsh-bilibili] media element error',
+                  media ? media.code + ' ' + media.message : 'unknown',
+                  'src=' + String(state.stream || '').slice(0, 120),
+                );
+              },
             })
           : h(
               'div',
@@ -1161,7 +1206,8 @@ window.__ModuleLoader__.load({
               ),
             );
 
-      // Only worth showing when there is a real choice to make.
+      // A real choice gets a dropdown; a single quality still gets a label, so
+      // the viewer can see which ceiling the account actually got.
       const qualities = state.qualities || [];
       const picker =
         qualities.length > 1
@@ -1179,7 +1225,13 @@ window.__ModuleLoader__.load({
                 h('option', { key: entry.qn, value: String(entry.qn) }, entry.label),
               ),
             )
-          : null;
+          : (state.qualityLabel || '') === ''
+            ? null
+            : h(
+                'span',
+                { className: 'dsh-bilibili-qualitytag', title: t('quality') },
+                state.qualityLabel,
+              );
 
       return h(
         React.Fragment,
