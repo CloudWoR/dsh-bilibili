@@ -146,3 +146,7 @@ dsh-bilibili/
 
 - [`qrcode-generator`](https://github.com/kazuhikoarase/qrcode-generator)（MIT，零依赖）— 二维码编码。
   仅使用其 ESM 默认导出；注意它的 `stringToBytes` 默认是 latin1，本插件用 `TextEncoder` 覆盖以保证字节正确。
+
+## License
+
+[MIT](LICENSE) © 2026 CloudWoR
