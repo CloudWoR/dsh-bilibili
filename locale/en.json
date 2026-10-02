@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-bilibili",
+    "description": "A closable Bilibili widget docked to the bottom-right corner, with QR sign-in and account display."
+  }
+}
