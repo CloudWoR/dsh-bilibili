@@ -68,6 +68,18 @@ const BILI_RETRY_DELAY_MS = 700;
 const CDN_MARKERS = ["bilivideo", "mountaintoys", "hdslb", "akamaized"];
 
 /**
+ * Bilibili quality ids, used only as a fallback label when `playurl` returns an
+ * id without a description. `accept_quality` is ordered best-first.
+ */
+const QUALITY_LABELS = {
+  6: "240P", 16: "360P", 32: "480P", 64: "720P", 74: "720P60",
+  80: "1080P", 112: "1080P+", 116: "1080P60", 120: "4K", 125: "HDR",
+  126: "杜比视界", 127: "8K",
+};
+/** Ask for the top of the ladder and let Bilibili answer with its own ceiling. */
+const QUALITY_REQUEST_MAX = 127;
+
+/**
  * Bilibili reports the scan state inside `data.code`; the outer `code` only
  * says whether the call itself succeeded.
  */
@@ -367,7 +379,7 @@ async function resolveCid(bvid, headers) {
  * @param cid - page id (the feed already carries it).
  * @returns `{ url, quality, format, size }`.
  */
-async function fetchPlay(bvid, cid) {
+async function fetchPlay(bvid, cid, qn) {
   const record = await readSession();
   const headers = { ...BILI_HEADERS };
   if (record !== null) headers.Cookie = record.cookie;
@@ -376,11 +388,17 @@ async function fetchPlay(bvid, cid) {
   if (!Number.isFinite(pageId) || pageId <= 0) {
     pageId = await resolveCid(bvid, headers);
   }
+  // Asking for the top of the ladder returns Bilibili's own ceiling for this
+  // account and video, and that ceiling is what "highest quality" means here.
+  // NOTE: with fnval=1 (progressive mp4) that ceiling is 720P — anything above
+  // it is only served as DASH, which a plain <video> cannot play.
+  const requested = Number.isFinite(qn) && qn > 0 ? Math.floor(qn) : QUALITY_REQUEST_MAX;
   const url =
     PLAYURL_URL +
     "?bvid=" + encodeURIComponent(bvid) +
     "&cid=" + encodeURIComponent(pageId) +
-    "&qn=64&fnval=1&fnver=0&fourk=1";
+    "&qn=" + requested +
+    "&fnval=1&fnver=0&fourk=1";
   const response = await biliFetch(url, headers);
   const text = await response.text();
   let body;
@@ -399,9 +417,19 @@ async function fetchPlay(bvid, cid) {
   if (!first || typeof first.url !== "string" || first.url === "") {
     throw new Error("no playable stream was returned");
   }
+  const ids = Array.isArray(data.accept_quality) ? data.accept_quality : [];
+  const labels = Array.isArray(data.accept_description) ? data.accept_description : [];
+  const qualities = ids.map((id, index) => ({
+    qn: Number(id),
+    label: labels[index] || QUALITY_LABELS[Number(id)] || String(id),
+  }));
+  const actual = Number(data.quality ?? 0);
+  const at = ids.indexOf(actual);
   return {
     url: first.url,
-    quality: Number(data.quality ?? 0),
+    quality: actual,
+    qualityLabel: at >= 0 && labels[at] ? labels[at] : QUALITY_LABELS[actual] || "",
+    qualities,
     format: String(data.format ?? ""),
     size: Number(first.size ?? 0),
   };
@@ -1128,13 +1156,22 @@ function registerPlayRoutes(ctx) {
           }
           try {
             // `cid` is optional: search results and some history rows have none,
-            // and fetchPlay resolves it from the video page.
-            const play = await fetchPlay(bvid, Number.isFinite(cid) ? cid : 0);
+            // and fetchPlay resolves it from the video page. `qn` is optional
+            // too: without it fetchPlay asks for the top of the ladder and
+            // reports back whatever ceiling Bilibili grants this account.
+            const asked = Number(params.get("qn"));
+            const play = await fetchPlay(
+              bvid,
+              Number.isFinite(cid) ? cid : 0,
+              Number.isFinite(asked) ? asked : 0,
+            );
             // Only ever hand back a pointer into our own media route.
             send(200, {
               ok: true,
               bvid,
               quality: play.quality,
+              qualityLabel: play.qualityLabel,
+              qualities: play.qualities,
               format: play.format,
               size: play.size,
               stream: MEDIA_PATH + "?u=" + encodeURIComponent(play.url),

@@ -73,6 +73,7 @@ window.__ModuleLoader__.load({
         playFailed: '视频加载失败',
         back: '返回',
         loadingNext: '加载中…',
+        quality: '清晰度',
         searchPlaceholder: '搜索 B 站视频…',
         searchAction: '搜索',
         searchTitle: '搜索：',
@@ -120,6 +121,7 @@ window.__ModuleLoader__.load({
         playFailed: 'Could not load the video',
         back: 'Back',
         loadingNext: 'Loading…',
+        quality: 'Quality',
         searchPlaceholder: 'Search Bilibili videos…',
         searchAction: 'Search',
         searchTitle: 'Search: ',
@@ -485,6 +487,26 @@ window.__ModuleLoader__.load({
   color: var(--dsw-alias-brand-primary);
   background: var(--dsw-alias-bg-layer-2);
 }
+.dsh-bilibili-quality {
+  appearance: none;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 16px;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.dsh-bilibili-quality:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.dsh-bilibili-quality:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: 1px;
+}
 .dsh-bilibili-videowrap {
   position: relative;
   width: 100%;
@@ -795,53 +817,102 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         tRef.current = t;
       });
+      const videoRef = React.useRef(null);
 
-      React.useEffect(() => {
-        let cancelled = false;
-        setState({ status: 'loading' });
-        (async () => {
+      // One resolver for the first load and for every quality switch. `qn` 0
+      // means "let the Host pick the highest this account is allowed".
+      const resolve = React.useCallback(
+        async (qn, resumeAt) => {
+          setState((prev) => Object.assign({}, prev, { status: 'loading' }));
           try {
             const payload = await callHost(
               'GET',
               undefined,
               PLAY +
                 '?bvid=' + encodeURIComponent(item.bvid) +
-                '&cid=' + encodeURIComponent(item.cid),
+                '&cid=' + encodeURIComponent(item.cid) +
+                (qn > 0 ? '&qn=' + qn : ''),
             );
-            if (cancelled) return;
             if (!payload.ok) throw new Error(payload.error || tRef.current('playFailed'));
-            setState({ status: 'ready', stream: payload.stream });
+            setState({
+              status: 'ready',
+              stream: payload.stream,
+              qualities: payload.qualities || [],
+              quality: payload.quality || 0,
+              qualityLabel: payload.qualityLabel || '',
+              resumeAt: resumeAt > 0 ? resumeAt : 0,
+            });
           } catch (cause) {
-            if (cancelled) return;
             setState({ status: 'error', error: String((cause && cause.message) || cause) });
           }
-        })();
-        return () => {
-          cancelled = true;
-        };
-      }, [item.bvid, item.cid]);
+        },
+        [item.bvid, item.cid],
+      );
+
+      React.useEffect(() => {
+        resolve(0, 0);
+      }, [resolve]);
+
+      // A quality switch swaps the source, and the new element starts at 0 —
+      // so put the viewer back where they were.
+      const onLoadedMetadata = () => {
+        const el = videoRef.current;
+        if (el !== null && state.resumeAt > 0 && Math.abs(el.currentTime - state.resumeAt) > 0.5) {
+          el.currentTime = state.resumeAt;
+        }
+      };
+
+      const switchQuality = (qn) => {
+        const el = videoRef.current;
+        resolve(qn, el !== null ? el.currentTime : 0);
+      };
 
       const frame =
         state.status === 'ready'
           ? h('video', {
+              ref: videoRef,
               className: 'dsh-bilibili-video',
               src: state.stream,
               controls: true,
               autoPlay: true,
               playsInline: true,
               preload: 'metadata',
+              onLoadedMetadata: onLoadedMetadata,
             })
           : h(
               'div',
               { className: 'dsh-bilibili-videofallback' },
               h(
                 'span',
-                { className: state.status === 'error' ? 'dsh-bilibili-error' : 'dsh-bilibili-note' },
+                {
+                  className:
+                    state.status === 'error' ? 'dsh-bilibili-error' : 'dsh-bilibili-note',
+                },
                 state.status === 'error'
                   ? t('playFailed') + '：' + state.error
                   : t('playLoading'),
               ),
             );
+
+      // Only worth showing when there is a real choice to make.
+      const qualities = state.qualities || [];
+      const picker =
+        qualities.length > 1
+          ? h(
+              'select',
+              {
+                className: 'dsh-bilibili-quality',
+                value: String(state.quality || ''),
+                title: t('quality'),
+                'aria-label': t('quality'),
+                disabled: state.status !== 'ready',
+                onChange: (event) => switchQuality(Number(event.target.value)),
+              },
+              qualities.map((entry) =>
+                h('option', { key: entry.qn, value: String(entry.qn) }, entry.label),
+              ),
+            )
+          : null;
 
       return h(
         React.Fragment,
@@ -859,11 +930,7 @@ window.__ModuleLoader__.load({
             '← ' + t('back'),
           ),
           h('span', { className: 'dsh-bilibili-spacer' }),
-          h(
-            'span',
-            { className: 'dsh-bilibili-feedtitle', title: item.title },
-            item.author,
-          ),
+          picker,
         ),
         h('div', { className: 'dsh-bilibili-videowrap' }, frame),
         h('div', { className: 'dsh-bilibili-videotitle', title: item.title }, item.title),
