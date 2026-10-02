@@ -30,6 +30,8 @@ window.__ModuleLoader__.load({
     const LOGIN_POLL = '/dsh-bilibili/login/poll';
     const FEED = '/dsh-bilibili/feed';
     const PLAY = '/dsh-bilibili/play';
+    const DASH = '/dsh-bilibili/dash';
+    const MEDIA = '/dsh-bilibili/media';
     const LIBRARY = '/dsh-bilibili/library';
 
     const DICTS = {
@@ -74,6 +76,7 @@ window.__ModuleLoader__.load({
         back: '返回',
         loadingNext: '加载中…',
         quality: '清晰度',
+        qualityFellBack: '高清流不可用，已回退到 720P',
         searchPlaceholder: '搜索 B 站视频…',
         searchAction: '搜索',
         searchTitle: '搜索：',
@@ -122,6 +125,7 @@ window.__ModuleLoader__.load({
         back: 'Back',
         loadingNext: 'Loading…',
         quality: 'Quality',
+        qualityFellBack: 'High-quality stream unavailable; using 720P',
         searchPlaceholder: 'Search Bilibili videos…',
         searchAction: 'Search',
         searchTitle: 'Search: ',
@@ -807,6 +811,203 @@ window.__ModuleLoader__.load({
      * is what makes seeking and resuming possible.
      * @param props - `t` seat, the feed item, and a back callback.
      */
+    /** Idle helper for the append scheduler. */
+    function wait(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    /** Fetch one byte range of a DASH track through our own media proxy. */
+    async function fetchRange(url, from, to) {
+      const response = await fetch(MEDIA + '?u=' + encodeURIComponent(url), {
+        headers: { Range: 'bytes=' + from + '-' + to },
+      });
+      if (!response.ok) throw new Error('range fetch failed: HTTP ' + response.status);
+      return response.arrayBuffer();
+    }
+
+    /** Append to a SourceBuffer and resolve once it has actually taken it. */
+    function appendTo(sourceBuffer, bytes) {
+      return new Promise((resolve, reject) => {
+        const done = () => {
+          sourceBuffer.removeEventListener('updateend', done);
+          sourceBuffer.removeEventListener('error', failed);
+          resolve();
+        };
+        const failed = () => {
+          sourceBuffer.removeEventListener('updateend', done);
+          sourceBuffer.removeEventListener('error', failed);
+          reject(new Error('the media buffer rejected a fragment'));
+        };
+        sourceBuffer.addEventListener('updateend', done, { once: true });
+        sourceBuffer.addEventListener('error', failed, { once: true });
+        try {
+          sourceBuffer.appendBuffer(bytes);
+        } catch (error) {
+          failed();
+        }
+      });
+    }
+
+    /** End of the last buffered range, or 0 before anything is buffered. */
+    function bufferedEnd(sourceBuffer) {
+      const ranges = sourceBuffer.buffered;
+      return ranges.length === 0 ? 0 : ranges.end(ranges.length - 1);
+    }
+
+    /** Which fragment covers a point in time (linear: at most a few hundred). */
+    function segmentIndexAt(track, seconds) {
+      const segments = track.segments;
+      for (let i = 0; i < segments.length; i++) {
+        if (seconds < segments[i].t1) return i;
+      }
+      return Math.max(0, segments.length - 1);
+    }
+
+    /** How many seconds of media to keep appended ahead of the playhead. */
+    const DASH_AHEAD_SECONDS = 25;
+    /** How much to drop behind the playhead, so the buffer cannot grow forever. */
+    const DASH_KEEP_BEHIND_SECONDS = 30;
+
+    /**
+     * Check the browser can actually decode this DASH manifest. Better to know
+     * here, before tearing the <video> element's source out from under it.
+     */
+    function canPlayDash(descriptor) {
+      if (typeof MediaSource === 'undefined') return false;
+      const one = (track) =>
+        track == null ||
+        MediaSource.isTypeSupported(track.mimeType + '; codecs="' + track.codecs + '"');
+      try {
+        return one(descriptor.video) && one(descriptor.audio);
+      } catch (error) {
+        return false;
+      }
+    }
+
+    /**
+     * Play a DASH manifest through MSE.
+     *
+     * Bilibili only serves above 720P as DASH, whose media is a single file
+     * addressed by byte ranges (`SegmentBase`): the Host parses the sidx and
+     * hands over the byte range of every fragment, so this only has to fetch
+     * ranges, append them, and keep a window ahead of the playhead. Seeking is
+     * the browser's own, as long as the target fragment is appended.
+     *
+     * @param videoEl - the <video> to drive.
+     * @param descriptor - the Host's DASH descriptor.
+     * @param onError - called when the pipeline gives up.
+     * @returns a handle with `stop()`.
+     */
+    function startDash(videoEl, descriptor, onError) {
+      const source = new MediaSource();
+      const objectUrl = URL.createObjectURL(source);
+      let stopped = false;
+
+      const states = [descriptor.video, descriptor.audio]
+        .filter(Boolean)
+        .map((track) => ({
+          track,
+          buffer: null,
+          next: 0,
+          primed: false,
+          appended: new Set(),
+        }));
+
+      async function pump(state) {
+        while (!stopped) {
+          if (state.next >= state.track.segments.length) return;
+          if (bufferedEnd(state.buffer) - (videoEl.currentTime || 0) > DASH_AHEAD_SECONDS) {
+            await wait(800);
+            continue;
+          }
+          if (state.buffer.updating) {
+            await wait(120);
+            continue;
+          }
+          try {
+            if (!state.primed) {
+              const init = await fetchRange(state.track.url, 0, state.track.initEnd);
+              if (stopped) return;
+              await appendTo(state.buffer, init);
+              state.primed = true;
+              continue;
+            }
+            const index = state.next;
+            if (state.appended.has(index)) {
+              state.next = index + 1;
+              continue;
+            }
+            const segment = state.track.segments[index];
+            const from = state.track.mediaStart + segment.off;
+            const bytes = await fetchRange(state.track.url, from, from + segment.len - 1);
+            if (stopped) return;
+            await appendTo(state.buffer, bytes);
+            state.appended.add(index);
+            state.next = index + 1;
+          } catch (error) {
+            if (stopped) return;
+            onError(error);
+            return;
+          }
+        }
+      }
+
+      // A seek just moves the append window; already-buffered data stays put,
+      // which is what makes seeking back and forth instant.
+      const onSeeking = () => {
+        const target = videoEl.currentTime;
+        for (const state of states) {
+          state.next = segmentIndexAt(state.track, target);
+          if (state.buffer === null || state.buffer.updating) continue;
+          const dropTo = Math.max(0, target - DASH_KEEP_BEHIND_SECONDS);
+          if (dropTo > 1) {
+            try {
+              state.buffer.remove(0, dropTo);
+            } catch (error) {
+              /* a failed eviction is harmless; the quota path will retry */
+            }
+          }
+        }
+      };
+
+      source.addEventListener('sourceopen', () => {
+        try {
+          for (const state of states) {
+            const mime = state.track.mimeType + '; codecs="' + state.track.codecs + '"';
+            state.buffer = source.addSourceBuffer(mime);
+            state.buffer.mode = 'segments';
+          }
+        } catch (error) {
+          onError(error);
+          return;
+        }
+        videoEl.addEventListener('seeking', onSeeking);
+        for (const state of states) void pump(state);
+      });
+
+      videoEl.src = objectUrl;
+      videoEl.load();
+
+      return {
+        stop() {
+          stopped = true;
+          videoEl.removeEventListener('seeking', onSeeking);
+          try {
+            if (source.readyState === 'open') source.endOfStream();
+          } catch (error) {
+            /* already closed */
+          }
+          try {
+            videoEl.removeAttribute('src');
+            videoEl.load();
+          } catch (error) {
+            /* element already gone */
+          }
+          URL.revokeObjectURL(objectUrl);
+        },
+      };
+    }
+
     function Player(props) {
       const t = props.t;
       const item = props.item;
@@ -818,28 +1019,54 @@ window.__ModuleLoader__.load({
         tRef.current = t;
       });
       const videoRef = React.useRef(null);
+      const engineRef = React.useRef(null);
 
-      // One resolver for the first load and for every quality switch. `qn` 0
-      // means "let the Host pick the highest this account is allowed".
+      // Resolve a source: DASH first so the viewer gets the real ceiling, then
+      // the progressive mp4 path when MSE cannot take the stream. `qn` 0 means
+      // "the highest this account may have".
       const resolve = React.useCallback(
         async (qn, resumeAt) => {
-          setState((prev) => Object.assign({}, prev, { status: 'loading' }));
+          if (engineRef.current !== null) {
+            engineRef.current.stop();
+            engineRef.current = null;
+          }
+          setState({ status: 'loading' });
+          const suffix =
+            '?bvid=' + encodeURIComponent(item.bvid) +
+            '&cid=' + encodeURIComponent(item.cid) +
+            (qn > 0 ? '&qn=' + qn : '');
           try {
-            const payload = await callHost(
-              'GET',
-              undefined,
-              PLAY +
-                '?bvid=' + encodeURIComponent(item.bvid) +
-                '&cid=' + encodeURIComponent(item.cid) +
-                (qn > 0 ? '&qn=' + qn : ''),
-            );
-            if (!payload.ok) throw new Error(payload.error || tRef.current('playFailed'));
+            let dash = null;
+            try {
+              const payload = await callHost('GET', undefined, DASH + suffix);
+              if (payload.ok && payload.video) dash = payload;
+            } catch (error) {
+              dash = null;
+            }
+            if (dash !== null && canPlayDash(dash)) {
+              setState({
+                status: 'ready',
+                mode: 'dash',
+                descriptor: dash,
+                qualities: dash.qualities || [],
+                quality: dash.quality || 0,
+                qualityLabel: dash.qualityLabel || '',
+                resumeAt: resumeAt > 0 ? resumeAt : 0,
+              });
+              return;
+            }
+            const payload = await callHost('GET', undefined, PLAY + suffix);
+            if (!payload.ok) {
+              throw new Error(payload.error || tRef.current('playFailed'));
+            }
             setState({
               status: 'ready',
+              mode: 'mp4',
               stream: payload.stream,
               qualities: payload.qualities || [],
               quality: payload.quality || 0,
               qualityLabel: payload.qualityLabel || '',
+              note: dash === null ? '' : tRef.current('qualityFellBack'),
               resumeAt: resumeAt > 0 ? resumeAt : 0,
             });
           } catch (cause) {
@@ -853,18 +1080,58 @@ window.__ModuleLoader__.load({
         resolve(0, 0);
       }, [resolve]);
 
-      // A quality switch swaps the source, and the new element starts at 0 —
-      // so put the viewer back where they were.
+      // Drive MSE once the descriptor is in, and tear it down on any change.
+      React.useEffect(() => {
+        if (state.status !== 'ready' || state.mode !== 'dash') return undefined;
+        const element = videoRef.current;
+        if (element === null) return undefined;
+        const applyResume = () => {
+          if (state.resumeAt > 0 && Math.abs(element.currentTime - state.resumeAt) > 0.5) {
+            try {
+              element.currentTime = state.resumeAt;
+            } catch (error) {
+              /* the source may not be seekable yet */
+            }
+          }
+        };
+        element.addEventListener('loadedmetadata', applyResume, { once: true });
+        let engine = null;
+        try {
+          engine = startDash(element, state.descriptor, (error) => {
+            setState({
+              status: 'error',
+              error: String((error && error.message) || error),
+            });
+          });
+          engineRef.current = engine;
+        } catch (error) {
+          setState({
+            status: 'error',
+            error: 'DASH playback failed: ' + String((error && error.message) || error),
+          });
+        }
+        return () => {
+          element.removeEventListener('loadedmetadata', applyResume);
+          if (engine !== null) engine.stop();
+          engineRef.current = null;
+        };
+      }, [state.status, state.mode, state.descriptor]);
+
+      // Keep the position when the source is swapped (mp4 quality switch).
       const onLoadedMetadata = () => {
-        const el = videoRef.current;
-        if (el !== null && state.resumeAt > 0 && Math.abs(el.currentTime - state.resumeAt) > 0.5) {
-          el.currentTime = state.resumeAt;
+        const element = videoRef.current;
+        if (
+          element !== null &&
+          state.resumeAt > 0 &&
+          Math.abs(element.currentTime - state.resumeAt) > 0.5
+        ) {
+          element.currentTime = state.resumeAt;
         }
       };
 
       const switchQuality = (qn) => {
-        const el = videoRef.current;
-        resolve(qn, el !== null ? el.currentTime : 0);
+        const element = videoRef.current;
+        resolve(qn, element !== null ? element.currentTime : 0);
       };
 
       const frame =
@@ -872,12 +1139,12 @@ window.__ModuleLoader__.load({
           ? h('video', {
               ref: videoRef,
               className: 'dsh-bilibili-video',
-              src: state.stream,
+              src: state.mode === 'mp4' ? state.stream : undefined,
               controls: true,
               autoPlay: true,
               playsInline: true,
               preload: 'metadata',
-              onLoadedMetadata: onLoadedMetadata,
+              onLoadedMetadata: state.mode === 'mp4' ? onLoadedMetadata : undefined,
             })
           : h(
               'div',
@@ -932,6 +1199,7 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsh-bilibili-spacer' }),
           picker,
         ),
+        state.note ? h('div', { className: 'dsh-bilibili-note' }, state.note) : null,
         h('div', { className: 'dsh-bilibili-videowrap' }, frame),
         h('div', { className: 'dsh-bilibili-videotitle', title: item.title }, item.title),
         h(

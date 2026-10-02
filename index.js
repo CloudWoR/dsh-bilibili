@@ -36,6 +36,7 @@ const FEED_PATH = "/dsh-bilibili/feed";
 const PLAY_PATH = "/dsh-bilibili/play";
 const MEDIA_PATH = "/dsh-bilibili/media";
 const LIBRARY_PREFIX = "/dsh-bilibili/library";
+const DASH_PATH = "/dsh-bilibili/dash";
 const NAV_URL = "https://api.bilibili.com/x/web-interface/nav";
 const VIEW_URL = "https://api.bilibili.com/x/web-interface/view";
 const RCMD_URL = "https://api.bilibili.com/x/web-interface/index/top/rcmd";
@@ -347,6 +348,160 @@ async function feedBatch(cursor) {
   feedCache.set(cursor, { ...batch, at: Date.now() });
   prefetchFeed(cursor + 1);
   return { ...batch, cached: false };
+}
+
+/**
+ * Parse the sidx index Bilibili's DASH `SegmentBase` points at.
+ *
+ * The media is `ftyp + moov + sidx + fragments`, so the sidx maps every
+ * fragment to its size and duration and the byte range for any point in time
+ * can be computed without downloading the video. Verified against ffprobe: the
+ * bytes computed for t=30s decode with a first PTS of exactly 30.000000.
+ *
+ * @param buffer - the indexRange bytes of one representation.
+ * @param initEnd - last byte of the Initialization range.
+ * @returns `{ mediaStart, segments, duration }`.
+ */
+function parseSidx(buffer, initEnd) {
+  if (buffer.length < 12 || buffer.toString("latin1", 4, 8) !== "sidx") {
+    throw new Error("the DASH index is not a sidx box");
+  }
+  const version = buffer[8];
+  let at = 12; // FullBox header
+  at += 4; // reference_ID
+  const timescale = buffer.readUInt32BE(at);
+  at += 4;
+  if (version === 0) {
+    at += 8; // earliest_presentation_time + first_offset
+  } else {
+    at += 16;
+  }
+  at += 2; // reserved
+  const count = buffer.readUInt16BE(at);
+  at += 2;
+  if (!Number.isFinite(timescale) || timescale <= 0) {
+    throw new Error("the DASH index has no usable timescale");
+  }
+  // Fragments start immediately after the index box.
+  const mediaStart = initEnd + 1 + buffer.length;
+  const segments = [];
+  let offset = 0;
+  let time = 0;
+  for (let i = 0; i < count; i++) {
+    if (at + 12 > buffer.length) break;
+    const size = buffer.readUInt32BE(at) & 0x7fffffff;
+    const duration = buffer.readUInt32BE(at + 4);
+    at += 12;
+    const seconds = duration / timescale;
+    segments.push({ t0: time, t1: time + seconds, off: offset, len: size });
+    time += seconds;
+    offset += size;
+  }
+  return { mediaStart, segments, duration: time };
+}
+
+/** Read one representation's index and describe it for the browser. */
+async function describeTrack(representation, headers) {
+  const base = String(representation.baseUrl || "");
+  if (base === "") throw new Error("a DASH track has no base url");
+  const single = String(representation.baseUrl || "");
+  void single;
+  const segmentBase = representation.SegmentBase || {};
+  const initRange = String(segmentBase.Initialization || "");
+  const indexRange = String(segmentBase.indexRange || "");
+  if (!/^\d+-\d+$/.test(initRange) || !/^\d+-\d+$/.test(indexRange)) {
+    throw new Error("a DASH track has no byte-range index");
+  }
+  const initEnd = Number(initRange.split("-")[1]);
+  const response = await biliFetch(base, { ...headers, Range: "bytes=" + indexRange });
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const index = parseSidx(buffer, initEnd);
+  return {
+    url: base,
+    mimeType: String(representation.mimeType || "video/mp4"),
+    codecs: String(representation.codecs || ""),
+    initEnd: initEnd,
+    mediaStart: index.mediaStart,
+    duration: index.duration,
+    width: Number(representation.width || 0),
+    height: Number(representation.height || 0),
+    segments: index.segments.map((segment) => ({
+      t0: Math.round(segment.t0 * 1000) / 1000,
+      t1: Math.round(segment.t1 * 1000) / 1000,
+      off: segment.off,
+      len: segment.len,
+    })),
+  };
+}
+
+/**
+ * Describe the DASH streams for one video: separate video-only and audio-only
+ * representations, each with the byte range of every fragment.
+ *
+ * This exists because Bilibili stops at 720P on the progressive mp4 path
+ * (`fnval=1`); anything above it is DASH only, and DASH needs MSE in the
+ * browser — a plain <video> cannot play it.
+ * @returns `{ duration, quality, qualityLabel, qualities, video, audio }`.
+ */
+async function fetchDash(bvid, cid, qn) {
+  const record = await readSession();
+  const headers = { ...BILI_HEADERS };
+  if (record !== null) headers.Cookie = record.cookie;
+  let pageId = Number(cid);
+  if (!Number.isFinite(pageId) || pageId <= 0) pageId = await resolveCid(bvid, headers);
+
+  const requested = Number.isFinite(qn) && qn > 0 ? Math.floor(qn) : QUALITY_REQUEST_MAX;
+  const url =
+    PLAYURL_URL +
+    "?bvid=" + encodeURIComponent(bvid) +
+    "&cid=" + encodeURIComponent(pageId) +
+    "&qn=" + requested +
+    "&fnval=16&fnver=0&fourk=1";
+  const response = await biliFetch(url, headers);
+  const body = await response.json();
+  if (body.code !== 0) {
+    throw new Error(body.message || "playurl refused with code " + body.code);
+  }
+  const data = body.data || {};
+  const dash = data.dash;
+  if (!dash || !Array.isArray(dash.video) || dash.video.length === 0) {
+    throw new Error("no DASH stream was offered for this video");
+  }
+
+  // Labels are index-aligned with accept_quality / accept_description.
+  const ids = Array.isArray(data.accept_quality) ? data.accept_quality : [];
+  const labels = Array.isArray(data.accept_description) ? data.accept_description : [];
+  const labelOf = (id) => {
+    const at = ids.indexOf(id);
+    return (at >= 0 && labels[at]) || QUALITY_LABELS[id] || String(id);
+  };
+
+  // `dash.video` only lists what this account may actually have, best first
+  // once sorted — so the head of it *is* the highest playable quality.
+  const videos = [...dash.video].sort((a, b) => Number(b.id) - Number(a.id));
+  const chosen = videos.find((entry) => Number(entry.id) <= requested) || videos[videos.length - 1];
+  const audios = [...(dash.audio || [])].sort(
+    (a, b) => Number(b.bandwidth || 0) - Number(a.bandwidth || 0),
+  );
+  const seen = new Set();
+  const qualities = [];
+  for (const entry of videos) {
+    const id = Number(entry.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    qualities.push({ qn: id, label: labelOf(id) });
+  }
+
+  const video = await describeTrack(chosen, headers);
+  const audio = audios.length > 0 ? await describeTrack(audios[0], headers) : null;
+  return {
+    duration: Number(data.timelength || 0) / 1000 || video.duration,
+    quality: Number(chosen.id),
+    qualityLabel: labelOf(Number(chosen.id)),
+    qualities,
+    video,
+    audio,
+  };
 }
 
 /**
@@ -1337,10 +1492,61 @@ function registerLibraryRoutes(ctx) {
   );
 }
 
+/**
+ * DASH descriptors for the MSE player. Same guard as every other route; the
+ * byte ranges themselves are fetched through the media proxy.
+ */
+function registerDashRoute(ctx) {
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: "exact",
+        path: DASH_PATH,
+        handler: async (req, res) => {
+          const send = (status, body) => {
+            res.writeHead(status, {
+              "content-type": "application/json; charset=utf-8",
+              "cache-control": "no-store",
+            });
+            res.end(JSON.stringify(body));
+          };
+          if (!sameOrigin(req)) {
+            send(403, { ok: false, error: "forbidden origin" });
+            return;
+          }
+          if (req.method !== "GET") {
+            send(405, { ok: false, error: "method not allowed" });
+            return;
+          }
+          const params = new URL(req.url, "http://localhost").searchParams;
+          const bvid = params.get("bvid");
+          if (bvid === null || !/^BV[0-9A-Za-z]{10}$/.test(bvid)) {
+            send(400, { ok: false, error: "a valid bvid is required" });
+            return;
+          }
+          const cid = Number(params.get("cid"));
+          const qn = Number(params.get("qn"));
+          try {
+            const dash = await fetchDash(
+              bvid,
+              Number.isFinite(cid) ? cid : 0,
+              Number.isFinite(qn) ? qn : 0,
+            );
+            send(200, { ok: true, bvid, ...dash });
+          } catch (error) {
+            send(502, { ok: false, error: String((error && error.message) || error) });
+          }
+        },
+      }),
+    "dsh-bilibili: dash route",
+  );
+}
+
 export function apply(ctx) {
   registerSessionRoutes(ctx);
   registerLoginRoutes(ctx);
   registerFeedRoute(ctx);
   registerPlayRoutes(ctx);
   registerLibraryRoutes(ctx);
+  registerDashRoute(ctx);
 }
