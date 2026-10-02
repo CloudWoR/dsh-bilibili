@@ -1370,10 +1370,13 @@ function registerPlayRoutes(ctx) {
         path: MEDIA_PATH,
         handler: async (req, res) => {
           const fail = (status, text) => {
-            if (!res.writableEnded) {
+            if (res.writableEnded) return;
+            // Headers may already be on the wire (a mid-stream failure); the
+            // status can no longer change, so just stop the response.
+            if (!res.headersSent) {
               res.writeHead(status, { "content-type": "text/plain; charset=utf-8" });
-              res.end(text);
             }
+            res.end(text);
           };
           if (!sameOrigin(req)) {
             fail(403, "forbidden origin");
@@ -1405,7 +1408,34 @@ function registerPlayRoutes(ctx) {
             const headers = { ...BILI_HEADERS };
             const range = req.headers.range;
             if (typeof range === "string" && range !== "") headers.Range = range;
-            const upstream = await fetch(target, { headers, signal: controller.signal });
+            // One failed outbound fetch used to surface as a hard 502 and abort
+            // the browser's fragment fetch. Bilibili's CDN does close
+            // connections under load, so retry before any byte is written —
+            // alongside the browser-side retry, this is what keeps playback
+            // from breaking mid-video.
+            let upstream = null;
+            let lastError = null;
+            for (let attempt = 0; attempt < 3 && upstream === null; attempt++) {
+              try {
+                upstream = await fetch(target, { headers, signal: controller.signal });
+              } catch (error) {
+                lastError = error;
+                if (controller.signal.aborted) break;
+                await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+              }
+            }
+            if (upstream === null) {
+              void trace(
+                "media FAILED url=" + String(target).slice(0, 80) +
+                " err=" + String((lastError && lastError.name) || "?") +
+                " " + String((lastError && lastError.message) || "?") +
+                " aborted=" + String(controller.signal.aborted),
+              );
+              throw lastError;
+            }
+            if (upstream.status >= 400) {
+              void trace("media upstream status=" + upstream.status + " url=" + String(target).slice(0, 80));
+            }
             const out = {
               "content-type": upstream.headers.get("content-type") || "video/mp4",
               "accept-ranges": "bytes",
@@ -1435,6 +1465,10 @@ function registerPlayRoutes(ctx) {
             }
             res.end();
           } catch (error) {
+            void trace(
+              "media THREW " + String((error && error.name) || "?") +
+              " " + String((error && error.message) || "?"),
+            );
             fail(502, "stream error: " + String((error && error.message) || error));
           }
         },

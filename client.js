@@ -822,13 +822,29 @@ window.__ModuleLoader__.load({
       return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
-    /** Fetch one byte range of a DASH track through our own media proxy. */
-    async function fetchRange(url, from, to) {
-      const response = await fetch(MEDIA + '?u=' + encodeURIComponent(url), {
-        headers: { Range: 'bytes=' + from + '-' + to },
-      });
-      if (!response.ok) throw new Error('range fetch failed: HTTP ' + response.status);
-      return response.arrayBuffer();
+    /**
+     * Fetch one byte range of a DASH track through our own media proxy.
+     *
+     * Retried: the proxy can answer 502 when Bilibili's CDN drops the upstream
+     * connection, and one lost fragment must not end playback. Transcript
+     * fetching is resumable, so a retry costs nothing.
+     */
+    async function fetchRange(url, from, to, attempts) {
+      const tries = attempts === undefined ? 4 : attempts;
+      let last = null;
+      for (let attempt = 0; attempt < tries; attempt++) {
+        try {
+          const response = await fetch(MEDIA + '?u=' + encodeURIComponent(url), {
+            headers: { Range: 'bytes=' + from + '-' + to },
+          });
+          if (!response.ok) throw new Error('range fetch failed: HTTP ' + response.status);
+          return await response.arrayBuffer();
+        } catch (error) {
+          last = error;
+          if (attempt + 1 < tries) await wait(300 * (attempt + 1));
+        }
+      }
+      throw last;
     }
 
     /** Append to a SourceBuffer and resolve once it has actually taken it. */
@@ -920,6 +936,10 @@ window.__ModuleLoader__.load({
         }));
 
       async function pump(state) {
+        // Consecutive failures are tolerated: a CDN hiccup should stall the
+        // player for a moment, not end the session. Only a sustained outage
+        // (about a minute of retries) is reported.
+        let failures = 0;
         while (!stopped) {
           if (state.next >= state.track.segments.length) return;
           if (bufferedEnd(state.buffer) - (videoEl.currentTime || 0) > DASH_AHEAD_SECONDS) {
@@ -950,10 +970,15 @@ window.__ModuleLoader__.load({
             await appendTo(state.buffer, bytes);
             state.appended.add(index);
             state.next = index + 1;
+            failures = 0;
           } catch (error) {
             if (stopped) return;
-            onError(error);
-            return;
+            failures += 1;
+            if (failures > 8) {
+              onError(error);
+              return;
+            }
+            await wait(700);
           }
         }
       }
