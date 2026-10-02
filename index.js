@@ -951,6 +951,24 @@ async function clearSession() {
 }
 
 /**
+ * Append one line to a small diagnostic trace.
+ *
+ * Playback happens in the browser, where this plugin cannot self-test, so the
+ * Host records what each playback request actually asked for. Never logs any
+ * cookie material. Truncates instead of growing without bound.
+ */
+async function trace(line) {
+  try {
+    const file = path.join(dataDir(), "trace.log");
+    await fs.appendFile(file, new Date().toISOString() + " " + line + "\n");
+    const stat = await fs.stat(file);
+    if (stat.size > 64 * 1024) await fs.writeFile(file, "");
+  } catch {
+    /* tracing must never break a request */
+  }
+}
+
+/**
  * Reject requests a foreign page triggered: a browser always sends `Origin`
  * for cross-site writes, and it will not match this server's own host.
  */
@@ -1309,6 +1327,9 @@ function registerPlayRoutes(ctx) {
             send(400, { ok: false, error: "a valid bvid is required" });
             return;
           }
+          void trace(
+            "play bvid=" + bvid + " cid=" + cid + " qn=" + String(params.get("qn") || "-"),
+          );
           try {
             // `cid` is optional: search results and some history rows have none,
             // and fetchPlay resolves it from the video page. `qn` is optional
@@ -1371,6 +1392,10 @@ function registerPlayRoutes(ctx) {
             fail(403, "forbidden host");
             return;
           }
+          void trace(
+            "media " + req.method + " range=" + String(req.headers.range || "-") +
+            " host=" + String(new URL(target).hostname || "?"),
+          );
           try {
             // Referer + UA are exactly what the CDN gates on. There is no
             // overall deadline here: it would abort the body of a 400 MB video
@@ -1526,6 +1551,7 @@ function registerDashRoute(ctx) {
           }
           const cid = Number(params.get("cid"));
           const qn = Number(params.get("qn"));
+          void trace("dash bvid=" + bvid + " cid=" + cid + " qn=" + qn);
           try {
             const dash = await fetchDash(
               bvid,
